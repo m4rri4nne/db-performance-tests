@@ -1,0 +1,12 @@
+{
+  "users": {
+    "countries": {"BR": 0.35, "US": 0.25, "DE": 0.15, "IN": 0.15, "OTHER": 0.10}
+  },
+  "orders": {
+    "status": {"paid": 0.55, "shipped": 0.25, "cancelled": 0.12, "pending": 0.08},
+    "items_per_order": {"min": 1, "max": 8, "avg": 2.5}
+  },
+  "inventory": {
+    "categories": {"electronics": 0.30, "clothing": 0.25, "food": 0.20, "books": 0.15, "other": 0.10}
+  }
+}
