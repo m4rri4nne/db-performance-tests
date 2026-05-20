@@ -1,0 +1,9 @@
+[tool.pytest.ini_options]
+testpaths = ["benchmarks"]
+pythonpath = ["."]
+addopts = "-v --junit-xml=reports/junit.xml"
+markers = [
+    "n_plus_one: N+1 query detection tests",
+    "deadlock: deadlock simulation tests",
+    "explain: EXPLAIN ANALYZE plan regression tests",
+]

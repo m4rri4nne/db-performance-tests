@@ -1,0 +1,72 @@
+name: Performance Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: perftest
+          POSTGRES_PASSWORD: perftest
+          POSTGRES_DB: perfdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    env:
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_NAME: perfdb
+      DB_USER: perftest
+      DB_PASSWORD: perftest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Apply schema
+        run: psql -h localhost -U perftest -d perfdb -f migrations/baseline/001_initial_schema.sql
+        env:
+          PGPASSWORD: perftest
+
+      - name: Seed data
+        run: python data/seed.py 1000
+
+      - name: Run tests
+        run: |
+          mkdir -p reports
+          pytest
+
+      - name: Publish test results
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: pytest results
+          path: reports/junit.xml
+          reporter: java-junit
+
+      - name: Upload JUnit XML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-xml
+          path: reports/junit.xml
