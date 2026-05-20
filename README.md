@@ -55,9 +55,11 @@ DB_PASSWORD=perftest
 **4. Apply the schema and seed data**
 
 ```bash
-python scripts/setup_schema.py
+python scripts/setup_schema.py --schema baseline/001_initial_schema
 python data/seed.py 10000
 ```
+
+`setup_schema.py` applies the SQL file and saves a `schema_v1.sql` snapshot next to it.
 
 ---
 
@@ -138,13 +140,46 @@ inventory_search   0.28      0.45      0.70  -74.5% ✓
 
 Queries that regressed by more than 20% are flagged with `⚠`.
 
-**5. Latency threshold gate**
+**5. Run the full test suite**
 
 ```bash
-pytest benchmarks/test_slow_queries.py -v
+pytest -v
 ```
 
-Fails if any critical query exceeds `SLOW_QUERY_THRESHOLD_MS` (200 ms, set in `config.py`).
+Runs all four test modules. Fails if any critical query exceeds `SLOW_QUERY_THRESHOLD_MS` (200 ms, set in `config.py`), if N+1 patterns appear in the optimized path, if deadlock detection doesn't behave as expected, or if the planner falls back to a Seq Scan on an indexed query.
+
+---
+
+## Test Suite
+
+Tests live in `benchmarks/` and are discovered automatically via `pyproject.toml`. Run all:
+
+```bash
+pytest -v
+```
+
+Run a specific scenario with a marker:
+
+```bash
+pytest -v -m n_plus_one   # N+1 detection tests
+pytest -v -m deadlock     # deadlock simulation tests
+pytest -v -m explain      # EXPLAIN ANALYZE plan regression tests
+```
+
+| File | Marker | What it checks |
+|---|---|---|
+| `test_n_plus_one.py` | `n_plus_one` | Bad path produces repeated queries; good path produces none |
+| `test_deadlock.py` | `deadlock` | Exactly one transaction commits and one is rolled back |
+| `test_explain.py` | `explain` | No Seq Scan on indexed queries; actual time within threshold |
+| `test_slow_queries.py` | _(none)_ | Five critical queries complete within 200 ms |
+
+Fixtures (`engine`, `instrumented_engine`) are defined in `conftest.py`. JUnit XML is written to `reports/junit.xml` after every run.
+
+---
+
+## CI
+
+Tests run automatically on every push and pull request to `main` via `.github/workflows/performance-tests.yml`. The workflow spins up a PostgreSQL 16 service container, applies the baseline schema with `psql`, seeds 1 000 rows, and runs `pytest`. Results are published as a check via `dorny/test-reporter` and the JUnit XML is uploaded as an artifact.
 
 ---
 
@@ -203,16 +238,22 @@ Each run truncates all tables. The seed is deterministic (`SEED = 42`).
 
 ```
 .
-├── config.py
+├── config.py                          # DB_URL and SLOW_QUERY_THRESHOLD_MS
+├── conftest.py                        # pytest fixtures: engine, instrumented_engine
+├── pyproject.toml                     # pytest config and markers
+├── requirements.txt
 ├── analysis/
-│   ├── n_plus_one_detector.py     # N+1 detection and simulation
-│   ├── deadlock_simulator.py      # Concurrent deadlock demo
-│   └── explain_analyzer.py        # EXPLAIN plan capture and diff
+│   ├── n_plus_one_detector.py         # N+1 detection and simulation
+│   ├── deadlock_simulator.py          # Concurrent deadlock demo
+│   └── explain_analyzer.py            # EXPLAIN plan capture and diff
 ├── benchmarks/
-│   ├── queries/                   # Raw .sql files
+│   ├── queries/                       # Raw .sql files (12 queries)
 │   ├── scenarios/
-│   │   └── run_benchmark.py       # Volume benchmark runner
-│   └── test_slow_queries.py       # pytest latency threshold gate
+│   │   └── run_benchmark.py           # Volume benchmark runner
+│   ├── test_n_plus_one.py             # N+1 detection tests
+│   ├── test_deadlock.py               # Deadlock tests
+│   ├── test_explain.py                # EXPLAIN ANALYZE plan tests
+│   └── test_slow_queries.py           # Latency threshold gate (5 critical queries)
 ├── data/
 │   ├── seed.py
 │   └── distributions.json
@@ -220,16 +261,19 @@ Each run truncates all tables. The seed is deterministic (`SEED = 42`).
 │   ├── baseline/
 │   │   └── 001_initial_schema.sql
 │   └── v2_add_indexes/
-│       └── 002_add_indexes.sql    # Sample migration for regression demo
+│       └── 002_add_indexes.sql        # Sample migration for regression demo
 ├── reports/
-│   ├── query_regression_report.py # Delta reporter (also exports to Grafana)
-│   ├── export_metrics.py          # Writes results to benchmark_results table
-│   ├── output/                    # Timestamped benchmark JSON results
-│   └── plans/                     # Saved EXPLAIN plans
+│   ├── query_regression_report.py     # Delta reporter (also exports to Grafana)
+│   ├── export_metrics.py              # Writes results to benchmark_results table
+│   ├── output/                        # Timestamped benchmark JSON results
+│   └── plans/                         # Saved EXPLAIN plans
 ├── scripts/
-│   └── setup_schema.py
+│   └── setup_schema.py                # Apply migration + snapshot schema
+├── .github/
+│   └── workflows/
+│       └── performance-tests.yml      # CI: schema → seed → pytest
 └── docker/
-    ├── docker-compose.yml         # PostgreSQL + Grafana
+    ├── docker-compose.yml             # PostgreSQL + Grafana
     ├── init.sql
     └── grafana/
         ├── provisioning/
