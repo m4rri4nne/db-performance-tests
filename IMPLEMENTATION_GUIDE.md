@@ -1,20 +1,50 @@
-# Database Performance Testing Suite — Step-by-Step Implementation Guide
+# Database Performance Testing Suite — Implementation Guide
 
-**Project:** db-performance-tests  
-**Estimated duration:** 4–5 weeks  
-**Complexity:** 4/5
+**Focus scenarios:** N+1 Query Detection · Deadlock Simulation · Query Regression Tracking Across Schema Changes
 
 ---
 
-## Phase 1 — Environment Setup (Week 1, Days 1–2)
+## Project structure
 
-### Step 1: Initialize the project structure
+```
+db-performance-tests/
+├── analysis/
+│   ├── n_plus_one_detector.py      # N+1 detection & simulation
+│   ├── deadlock_simulator.py       # Deadlock demo & mitigation guide
+│   └── explain_analyzer.py         # EXPLAIN ANALYZE plan capture & diff
+├── benchmarks/
+│   ├── queries/                    # SQL files for individual queries
+│   ├── scenarios/
+│   │   └── run_benchmark.py        # Volume benchmark runner
+│   └── test_slow_queries.py        # pytest latency threshold gate
+├── data/
+│   ├── distributions.json
+│   └── seed.py                     # Deterministic data generator
+├── docker/
+│   └── docker-compose.yml
+├── migrations/
+│   ├── baseline/
+│   │   └── 001_initial_schema.sql
+│   └── v2_add_indexes/
+│       └── 002_add_indexes.sql     # Sample migration for regression demo
+├── reports/
+│   ├── output/                     # Timestamped benchmark JSON results
+│   ├── plans/                      # Saved EXPLAIN plans (JSON)
+│   └── query_regression_report.py  # Regression delta reporter
+├── scripts/
+│   └── setup_schema.py
+└── config.py
+```
+
+---
+
+## Phase 1 — Environment Setup
+
+### Step 1: Initialize the project
 
 ```bash
-mkdir -p db-performance-tests/{benchmarks/{queries,scenarios},analysis,data,migrations/baseline,reports,docker}
-cd db-performance-tests
 git init
-touch README.md .gitignore
+touch .gitignore
 ```
 
 Add to `.gitignore`:
@@ -23,17 +53,17 @@ __pycache__/
 *.pyc
 .env
 reports/output/
+reports/plans/
 data/generated/
 ```
 
 ---
 
-### Step 2: Set up the Dockerized database
+### Step 2: Dockerized PostgreSQL
 
-Create `docker/docker-compose.yml`:
+`docker/docker-compose.yml`:
 
 ```yaml
-version: "3.9"
 services:
   postgres:
     image: postgres:16
@@ -58,22 +88,18 @@ volumes:
   pgdata:
 ```
 
-Create `docker/init.sql` with `pg_stat_statements` extension:
-
+`docker/init.sql`:
 ```sql
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 ```
 
-Start the container and verify:
-
 ```bash
 docker compose -f docker/docker-compose.yml up -d
-docker compose -f docker/docker-compose.yml exec postgres psql -U perftest -d perfdb -c "SELECT version();"
 ```
 
 ---
 
-### Step 3: Set up the Python environment
+### Step 3: Python environment
 
 ```bash
 python3 -m venv .venv
@@ -82,7 +108,7 @@ pip install psycopg2-binary sqlalchemy faker pytest python-dotenv tabulate
 pip freeze > requirements.txt
 ```
 
-Create `.env`:
+`.env`:
 ```
 DB_HOST=localhost
 DB_PORT=5432
@@ -91,8 +117,7 @@ DB_USER=perftest
 DB_PASSWORD=perftest
 ```
 
-Create `config.py` at the project root:
-
+`config.py`:
 ```python
 import os
 from dotenv import load_dotenv
@@ -108,11 +133,11 @@ SLOW_QUERY_THRESHOLD_MS = 200
 
 ---
 
-## Phase 2 — Schema & Realistic Data Generation (Week 1, Days 3–5)
+## Phase 2 — Schema & Data
 
-### Step 4: Define the baseline schema
+### Step 4: Baseline schema
 
-Create `migrations/baseline/001_initial_schema.sql`:
+`migrations/baseline/001_initial_schema.sql`:
 
 ```sql
 CREATE TABLE users (
@@ -147,791 +172,360 @@ CREATE TABLE inventory (
 );
 ```
 
-Apply the schema:
+Apply:
 ```bash
-docker compose -f docker/docker-compose.yml exec -T postgres \
-  psql -U perftest -d perfdb < migrations/baseline/001_initial_schema.sql
-```
-
-Snapshot current schema for regression comparison:
-```bash
-docker compose -f docker/docker-compose.yml exec postgres \
-  pg_dump -U perftest -d perfdb --schema-only > migrations/baseline/schema_v1.sql
+python scripts/setup_schema.py
 ```
 
 ---
 
-### Step 5: Define production-like data distributions
+### Step 5: Seed realistic data
 
-Create `data/distributions.json`:
-
-```json
-{
-  "users": {
-    "countries": {"BR": 0.35, "US": 0.25, "DE": 0.15, "IN": 0.15, "OTHER": 0.10}
-  },
-  "orders": {
-    "status": {"paid": 0.55, "shipped": 0.25, "cancelled": 0.12, "pending": 0.08},
-    "items_per_order": {"min": 1, "max": 8, "avg": 2.5}
-  },
-  "inventory": {
-    "categories": {"electronics": 0.30, "clothing": 0.25, "food": 0.20, "books": 0.15, "other": 0.10}
-  }
-}
+```bash
+python data/seed.py 1000      # quick smoke test
+python data/seed.py 10000     # development
+python data/seed.py 100000    # regression benchmarks
 ```
 
 ---
 
-### Step 6: Build the deterministic data generator
+## Phase 3 — N+1 Query Detection
 
-Create `data/seed.py`:
+### What it is
+
+An N+1 bug fires one query to fetch a list, then one more query per row to load related data — N extra round-trips that scale linearly with result size.
+
+```
+SELECT id, user_id FROM orders LIMIT 20           -- 1 query
+SELECT email FROM users WHERE id = 1              -- 1 per row
+SELECT email FROM users WHERE id = 2
+...                                               -- 21 total instead of 1
+```
+
+### Running the detector
+
+```bash
+python analysis/n_plus_one_detector.py
+```
+
+Expected output:
+
+```
+=== N+1 Query Detection Demo ===
+
+[BAD]  20 orders fetched → 21 queries fired (1 + 20)
+  N+1 candidates detected:
+    [20x] SELECT EMAIL FROM USERS WHERE ID = $?
+
+[GOOD] 20 orders+emails fetched → 1 query fired
+  No repeated patterns detected.
+```
+
+### How it works
+
+`analysis/n_plus_one_detector.py` registers a SQLAlchemy `before_cursor_execute` event listener that records every statement. After a code path runs, `detect(threshold)` normalizes each statement (strips literals) and counts occurrences — any pattern that appears N+ times is a candidate.
+
+### Detecting N+1 in your own code
 
 ```python
-import random
-import json
-from faker import Faker
-from sqlalchemy import create_engine, text
-from config import DB_URL
-
-SEED = 42
-fake = Faker()
-Faker.seed(SEED)
-random.seed(SEED)
-
-with open("data/distributions.json") as f:
-    DIST = json.load(f)
-
-def weighted_choice(distribution: dict) -> str:
-    keys = list(distribution.keys())
-    weights = list(distribution.values())
-    return random.choices(keys, weights=weights, k=1)[0]
-
-def generate(engine, n_users: int):
-    with engine.begin() as conn:
-        conn.execute(text(
-            "TRUNCATE order_items, orders, users, inventory RESTART IDENTITY CASCADE"
-        ))
-
-        # Users
-        users = [
-            {"email": fake.unique.email(), "country": weighted_choice(DIST["users"]["countries"])}
-            for _ in range(n_users)
-        ]
-        conn.execute(text(
-            "INSERT INTO users (email, country) VALUES (:email, :country)"
-        ), users)
-
-        # Inventory
-        products = [
-            {
-                "product_id": i,
-                "name": fake.word().title(),
-                "category": weighted_choice(DIST["inventory"]["categories"]),
-                "stock": random.randint(0, 500),
-            }
-            for i in range(1, 501)
-        ]
-        conn.execute(text(
-            "INSERT INTO inventory (product_id, name, category, stock) "
-            "VALUES (:product_id, :name, :category, :stock)"
-        ), products)
-
-        # Orders and items
-        n_orders = int(n_users * 2.5)
-        for order_num in range(1, n_orders + 1):
-            user_id = random.randint(1, n_users)
-            status = weighted_choice(DIST["orders"]["status"])
-            total = 0
-            conn.execute(text(
-                "INSERT INTO orders (id, user_id, status, total) "
-                "VALUES (:id, :user_id, :status, 0)"
-            ), {"id": order_num, "user_id": user_id, "status": status})
-
-            n_items = random.randint(
-                DIST["orders"]["items_per_order"]["min"],
-                DIST["orders"]["items_per_order"]["max"]
-            )
-            items = []
-            for _ in range(n_items):
-                price = round(random.uniform(5, 500), 2)
-                qty = random.randint(1, 5)
-                total += price * qty
-                items.append({
-                    "order_id": order_num,
-                    "product_id": random.randint(1, 500),
-                    "quantity": qty,
-                    "price": price,
-                })
-            conn.execute(text(
-                "INSERT INTO order_items (order_id, product_id, quantity, price) "
-                "VALUES (:order_id, :product_id, :quantity, :price)"
-            ), items)
-            conn.execute(text(
-                "UPDATE orders SET total = :total WHERE id = :id"
-            ), {"total": round(total, 2), "id": order_num})
-
-    print(f"Seeded {n_users} users, {n_orders} orders.")
-
-
-if __name__ == "__main__":
-    import sys
-    n = int(sys.argv[1]) if len(sys.argv) > 1 else 1000
-    engine = create_engine(DB_URL)
-    generate(engine, n)
-```
-
-Test each volume level:
-```bash
-python data/seed.py 1000      # 1K
-python data/seed.py 10000     # 10K
-python data/seed.py 100000    # 100K
-python data/seed.py 1000000   # 1M — takes several minutes
-```
-
----
-
-## Phase 3 — Benchmark Suite (Week 2)
-
-### Step 7: Write the critical query files
-
-Create `benchmarks/queries/user-lookup.sql`:
-```sql
-SELECT id, email, country FROM users WHERE email = :email;
-```
-
-Create `benchmarks/queries/order-history.sql`:
-```sql
-SELECT o.id, o.status, o.total, o.created_at
-FROM orders o
-WHERE o.user_id = :user_id
-ORDER BY o.created_at DESC
-LIMIT 20;
-```
-
-Create `benchmarks/queries/inventory-search.sql`:
-```sql
-SELECT product_id, name, stock
-FROM inventory
-WHERE category = :category AND stock > 0
-ORDER BY stock DESC
-LIMIT 50;
-```
-
-Add at least 7 more queries covering JOIN-heavy paths, aggregations, and subqueries.
-
----
-
-### Step 8: Build the volume benchmark scenarios
-
-Create `benchmarks/scenarios/run_benchmark.py`:
-
-```python
-import time
-import statistics
-import random
-from sqlalchemy import create_engine, text
-from config import DB_URL
-from data.seed import generate
-
-VOLUMES = {"low": 1_000, "medium": 100_000, "high": 1_000_000}
-ITERATIONS = 50
-
-QUERIES = {
-    "user_lookup": (
-        "SELECT id, email, country FROM users WHERE email = :p",
-        lambda conn: {"p": conn.execute(text("SELECT email FROM users ORDER BY random() LIMIT 1")).scalar()}
-    ),
-    "order_history": (
-        "SELECT o.id, o.status, o.total FROM orders o WHERE o.user_id = :p ORDER BY o.created_at DESC LIMIT 20",
-        lambda conn: {"p": random.randint(1, conn.execute(text("SELECT count(*) FROM users")).scalar())}
-    ),
-    "inventory_search": (
-        "SELECT product_id, name, stock FROM inventory WHERE category = :p AND stock > 0 LIMIT 50",
-        lambda conn: {"p": random.choice(["electronics", "clothing", "food", "books", "other"])}
-    ),
-}
-
-def benchmark_query(engine, label: str, sql: str, param_fn, iterations: int = ITERATIONS):
-    times = []
-    with engine.connect() as conn:
-        for _ in range(iterations):
-            params = param_fn(conn)
-            start = time.perf_counter()
-            conn.execute(text(sql), params)
-            times.append((time.perf_counter() - start) * 1000)
-    return {
-        "query": label,
-        "min_ms": round(min(times), 2),
-        "avg_ms": round(statistics.mean(times), 2),
-        "p95_ms": round(sorted(times)[int(len(times) * 0.95)], 2),
-        "max_ms": round(max(times), 2),
-    }
-
-def run_all(volume_label: str):
-    n_rows = VOLUMES[volume_label]
-    engine = create_engine(DB_URL)
-    print(f"\n=== Volume: {volume_label} ({n_rows:,} users) ===")
-    generate(engine, n_rows)
-    results = []
-    for label, (sql, param_fn) in QUERIES.items():
-        result = benchmark_query(engine, label, sql, param_fn)
-        results.append(result)
-        print(f"  {label}: avg={result['avg_ms']}ms  p95={result['p95_ms']}ms")
-    return results
-
-
-if __name__ == "__main__":
-    import sys
-    volume = sys.argv[1] if len(sys.argv) > 1 else "low"
-    run_all(volume)
-```
-
-Run benchmarks:
-```bash
-python benchmarks/scenarios/run_benchmark.py low
-python benchmarks/scenarios/run_benchmark.py medium
-python benchmarks/scenarios/run_benchmark.py high
-```
-
----
-
-## Phase 4 — Analysis Tools (Week 3)
-
-### Step 9: Build the EXPLAIN ANALYZE plan comparator
-
-Create `analysis/explain-analyzer.py`:
-
-```python
-import json
-from sqlalchemy import create_engine, text
-from config import DB_URL
+from analysis.n_plus_one_detector import attach_logger, reset_log, detect
+from sqlalchemy import create_engine
 
 engine = create_engine(DB_URL)
+attach_logger(engine)
 
-def explain(sql: str, params: dict = {}) -> dict:
-    with engine.connect() as conn:
-        result = conn.execute(
-            text(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}"), params
-        )
-        return result.fetchone()[0][0]
+# --- run the suspect code path here ---
+reset_log()
+your_function(engine)
+# --------------------------------------
 
-def compare(label: str, sql: str, params: dict = {}):
-    plan = explain(sql, params)
-    node = plan["Plan"]
-    print(f"\n--- {label} ---")
-    print(f"  Total cost:      {node['Total Cost']}")
-    print(f"  Actual rows:     {node['Actual Rows']}")
-    print(f"  Actual time ms:  {node['Actual Total Time']:.2f}")
-    print(f"  Node type:       {node['Node Type']}")
-    if "Plans" in node:
-        for child in node["Plans"]:
-            print(f"    └─ {child['Node Type']} (rows={child['Actual Rows']})")
-    return plan
-
-def save_plan(plan: dict, filename: str):
-    with open(f"reports/{filename}.json", "w") as f:
-        json.dump(plan, f, indent=2)
-
-if __name__ == "__main__":
-    # Before index
-    plan_before = compare(
-        "order_history — no index",
-        "SELECT id, status, total FROM orders WHERE user_id = :uid ORDER BY created_at DESC LIMIT 20",
-        {"uid": 42}
-    )
-    save_plan(plan_before, "plan_before_index")
-
-    # Create index
-    with engine.begin() as conn:
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id, created_at DESC)"))
-
-    # After index
-    plan_after = compare(
-        "order_history — with index",
-        "SELECT id, status, total FROM orders WHERE user_id = :uid ORDER BY created_at DESC LIMIT 20",
-        {"uid": 42}
-    )
-    save_plan(plan_after, "plan_after_index")
+findings = detect(threshold=5)
+for f in findings:
+    print(f"[{f['count']}x] {f['query']}")
 ```
 
-Run before and after a schema migration to capture diff:
+### The fix pattern
+
+| Pattern | Queries | Fix |
+|---|---|---|
+| Loop + SELECT per row | 1 + N | `JOIN` or `IN (id1, id2, …)` |
+| ORM lazy load | 1 + N | `joinedload()` / `selectinload()` |
+
+---
+
+## Phase 4 — Deadlock Simulation
+
+### What it is
+
+A deadlock occurs when two transactions each hold a lock the other needs, creating a cycle that neither can break. PostgreSQL detects the cycle automatically and rolls back one transaction (the "victim").
+
+```
+Tx A: locks order 1 ──► tries to lock order 2 ──► BLOCKED (B holds it)
+Tx B: locks order 2 ──► tries to lock order 1 ──► BLOCKED (A holds it)
+                                                    ▲
+                                              PostgreSQL rolls back one
+```
+
+### Running the simulator
+
 ```bash
-python analysis/explain-analyzer.py
+python analysis/deadlock_simulator.py
+```
+
+Expected output:
+
+```
+=== Deadlock Simulator ===
+
+--- Scenario: classic deadlock (reverse lock acquisition order) ---
+  Tx A: UPDATE order 1 → UPDATE order 2
+  Tx B: UPDATE order 2 → UPDATE order 1
+  Starting both transactions concurrently...
+
+  Transaction A: committed
+  Transaction B: rolled back — DeadlockDetected
+
+  PostgreSQL detected the cycle and rolled back Transaction B.
+  The surviving transaction committed. The rolled-back one can be retried.
+
+--- Prevention ---
+  Always acquire locks in a consistent global order across all transactions.
+  ...
+```
+
+### How it works
+
+`analysis/deadlock_simulator.py` uses `threading.Barrier(2)` to ensure both transactions have acquired their first lock before attempting the second. This makes the deadlock deterministic and reproducible.
+
+### Prevention
+
+The fix is a consistent lock-acquisition order across all code paths:
+
+```python
+# Bad — order depends on caller, can deadlock
+def update_two_orders(id_a, id_b):
+    UPDATE orders WHERE id = id_a
+    UPDATE orders WHERE id = id_b
+
+# Good — always process in ascending id order
+def update_two_orders(id_a, id_b):
+    for oid in sorted([id_a, id_b]):
+        UPDATE orders WHERE id = oid
 ```
 
 ---
 
-### Step 10: Build the N+1 query detector
+## Phase 5 — Query Regression Tracking Across Schema Changes
 
-Create `analysis/n-plus-one-detector.py`:
+This scenario answers: *"Did my migration make queries faster or slower?"*
 
-```python
-import re
-from collections import defaultdict
-from sqlalchemy import create_engine, text, event
-from config import DB_URL
+It combines three tools: the explain analyzer (plan-level diff), the regression report (latency delta table), and the slow-query pytest gate (CI-safe threshold check).
 
-_query_log: list[str] = []
+---
 
-def attach_logger(engine):
-    @event.listens_for(engine, "before_cursor_execute")
-    def log_query(conn, cursor, statement, parameters, context, executemany):
-        _query_log.append(statement.strip())
+### Step A: Capture a baseline
 
-def normalize(sql: str) -> str:
-    sql = re.sub(r"\s+", " ", sql)
-    sql = re.sub(r"=\s*\$\d+", "= ?", sql)
-    sql = re.sub(r"IN\s*\([^)]+\)", "IN (?)", sql)
-    return sql.upper().strip()
+Seed data, then run the regression report. This saves the first snapshot:
 
-def detect_n_plus_one(threshold: int = 5) -> list[dict]:
-    counts = defaultdict(int)
-    for q in _query_log:
-        counts[normalize(q)] += 1
-    return [
-        {"query": q, "count": c}
-        for q, c in sorted(counts.items(), key=lambda x: -x[1])
-        if c >= threshold
-    ]
+```bash
+python data/seed.py 10000
+python reports/query_regression_report.py low
+```
 
-def simulate_n_plus_one(engine, user_ids: list[int]):
-    with engine.connect() as conn:
-        orders = conn.execute(
-            text("SELECT id, user_id FROM orders WHERE user_id = ANY(:ids)"),
-            {"ids": user_ids}
-        ).fetchall()
-
-        # Intentional N+1: fetching user for each order separately
-        for order in orders:
-            conn.execute(
-                text("SELECT email FROM users WHERE id = :uid"),
-                {"uid": order.user_id}
-            )
-
-if __name__ == "__main__":
-    engine = create_engine(DB_URL)
-    attach_logger(engine)
-
-    with engine.connect() as conn:
-        ids = [r[0] for r in conn.execute(text("SELECT id FROM users LIMIT 20")).fetchall()]
-
-    simulate_n_plus_one(engine, ids)
-
-    findings = detect_n_plus_one(threshold=3)
-    print(f"\nN+1 candidates (>= 3 repeated calls):")
-    for f in findings:
-        print(f"  [{f['count']}x] {f['query'][:120]}")
+Output (first run, no previous data):
+```
+Regression Report — volume: low
+No previous run found — this result will be the baseline.
+Query            avg ms    p95 ms    max ms  Δ vs last
+user_lookup        0.45      0.82      1.20  —
+order_history      3.20      5.10      8.40  —
+inventory_search   1.10      1.80      2.30  —
 ```
 
 ---
 
-### Step 11: Build the deadlock simulator
+### Step B: Capture EXPLAIN plans before the migration
 
-Create `analysis/deadlock-simulator.py`:
+```bash
+python analysis/explain_analyzer.py
+```
 
-```python
-import threading
-import time
-from sqlalchemy import create_engine, text
-from config import DB_URL
+This saves `reports/plans/order_history_before_index.json` for diff later.
 
-def transaction_a(engine, result: dict):
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("UPDATE orders SET status='pending' WHERE id=1"))
-            time.sleep(0.3)  # hold lock, give B time to grab its lock
-            conn.execute(text("UPDATE orders SET status='paid' WHERE id=2"))
-            result["a"] = "committed"
-    except Exception as e:
-        result["a"] = f"deadlock/rollback: {e}"
+---
 
-def transaction_b(engine, result: dict):
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("UPDATE orders SET status='pending' WHERE id=2"))
-            time.sleep(0.3)
-            conn.execute(text("UPDATE orders SET status='paid' WHERE id=1"))
-            result["b"] = "committed"
-    except Exception as e:
-        result["b"] = f"deadlock/rollback: {e}"
+### Step C: Apply the migration
 
-def run():
-    engine = create_engine(DB_URL, pool_size=5)
-    result = {}
-    ta = threading.Thread(target=transaction_a, args=(engine, result))
-    tb = threading.Thread(target=transaction_b, args=(engine, result))
+```bash
+python scripts/setup_schema.py --schema v2_add_indexes/002_add_indexes
+```
 
-    print("Starting concurrent transactions (deadlock expected)...")
-    ta.start()
-    time.sleep(0.05)
-    tb.start()
-    ta.join()
-    tb.join()
+`migrations/v2_add_indexes/002_add_indexes.sql` adds three indexes:
 
-    print(f"\nTransaction A: {result.get('a')}")
-    print(f"Transaction B: {result.get('b')}")
-    print("\nResolution: PostgreSQL auto-detects deadlocks and rolls back one transaction.")
-    print("Mitigation: always acquire locks in a consistent global order.")
+```sql
+CREATE INDEX IF NOT EXISTS idx_orders_user_created
+    ON orders(user_id, created_at DESC);
 
-if __name__ == "__main__":
-    run()
+CREATE INDEX IF NOT EXISTS idx_order_items_order_id
+    ON order_items(order_id);
+
+CREATE INDEX IF NOT EXISTS idx_inventory_category_stock
+    ON inventory(category, stock) WHERE stock > 0;
 ```
 
 ---
 
-## Phase 5 — Index Effectiveness Tests (Week 3–4)
+### Step D: Run the regression report again
 
-### Step 12: Write index effectiveness test suite
-
-Create `benchmarks/scenarios/index_effectiveness.py`:
-
-```python
-from sqlalchemy import create_engine, text
-from analysis.explain_analyzer import compare, save_plan
-from config import DB_URL
-
-SCENARIOS = [
-    {
-        "label": "user_by_country",
-        "sql": "SELECT id, email FROM users WHERE country = :p",
-        "params": {"p": "BR"},
-        "index_ddl": "CREATE INDEX idx_users_country ON users(country)",
-        "drop_ddl": "DROP INDEX IF EXISTS idx_users_country",
-    },
-    {
-        "label": "inventory_by_category",
-        "sql": "SELECT product_id, name FROM inventory WHERE category = :p AND stock > 0",
-        "params": {"p": "electronics"},
-        "index_ddl": "CREATE INDEX idx_inventory_cat_stock ON inventory(category, stock)",
-        "drop_ddl": "DROP INDEX IF EXISTS idx_inventory_cat_stock",
-    },
-    {
-        "label": "orders_by_status",
-        "sql": "SELECT id, total FROM orders WHERE status = :p ORDER BY created_at DESC LIMIT 100",
-        "params": {"p": "paid"},
-        "index_ddl": "CREATE INDEX idx_orders_status ON orders(status, created_at DESC)",
-        "drop_ddl": "DROP INDEX IF EXISTS idx_orders_status",
-    },
-]
-
-def run():
-    engine = create_engine(DB_URL)
-    for s in SCENARIOS:
-        with engine.begin() as conn:
-            conn.execute(text(s["drop_ddl"]))
-
-        plan_before = compare(f"{s['label']} — no index", s["sql"], s["params"])
-        save_plan(plan_before, f"{s['label']}_before")
-
-        with engine.begin() as conn:
-            conn.execute(text(s["index_ddl"]))
-
-        plan_after = compare(f"{s['label']} — with index", s["sql"], s["params"])
-        save_plan(plan_after, f"{s['label']}_after")
-
-if __name__ == "__main__":
-    run()
+```bash
+python reports/query_regression_report.py low
 ```
+
+Output (after migration):
+```
+Regression Report — volume: low
+Comparing against last saved run.
+Query            avg ms    p95 ms    max ms  Δ vs last
+user_lookup        0.42      0.78      1.10  -6.7% ✓
+order_history      0.38      0.62      0.95  -88.1% ✓
+inventory_search   0.28      0.45      0.70  -74.5% ✓
+```
+
+Queries marked `✓` improved by more than 10%. Queries marked `⚠` regressed by more than 20%.
 
 ---
 
-## Phase 6 — Regression Tracking (Week 4)
+### Step E: Slow query threshold gate (pytest)
 
-### Step 13: Build the query regression report
-
-Create `reports/query-regression-report.py`:
-
-```python
-import json
-import os
-from datetime import datetime
-from tabulate import tabulate
-from benchmarks.scenarios.run_benchmark import run_all, VOLUMES
-
-RESULTS_DIR = "reports/output"
-os.makedirs(RESULTS_DIR, exist_ok=True)
-
-def load_previous(volume: str) -> dict | None:
-    path = f"{RESULTS_DIR}/{volume}_latest.json"
-    if os.path.exists(path):
-        with open(path) as f:
-            return json.load(f)
-    return None
-
-def save_results(volume: str, results: list[dict]):
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-    with open(f"{RESULTS_DIR}/{volume}_{ts}.json", "w") as f:
-        json.dump(results, f, indent=2)
-    with open(f"{RESULTS_DIR}/{volume}_latest.json", "w") as f:
-        json.dump(results, f, indent=2)
-
-def compare(current: list[dict], previous: list[dict] | None) -> list[list]:
-    prev_map = {r["query"]: r for r in (previous or [])}
-    rows = []
-    for r in current:
-        prev = prev_map.get(r["query"])
-        delta = ""
-        if prev:
-            diff = r["avg_ms"] - prev["avg_ms"]
-            pct = (diff / prev["avg_ms"]) * 100
-            delta = f"{'+' if diff > 0 else ''}{pct:.1f}%"
-        rows.append([r["query"], r["avg_ms"], r["p95_ms"], r["max_ms"], delta or "—"])
-    return rows
-
-def run():
-    for volume in VOLUMES:
-        current = run_all(volume)
-        previous = load_previous(volume)
-        save_results(volume, current)
-
-        print(f"\n=== Regression Report: {volume} ===")
-        rows = compare(current, previous)
-        print(tabulate(rows, headers=["Query", "avg ms", "p95 ms", "max ms", "Δ vs last"]))
-
-if __name__ == "__main__":
-    run()
-```
-
----
-
-## Phase 7 — CI Integration (Week 4–5)
-
-### Step 14: Set up the slow query threshold test
-
-Create `benchmarks/test_slow_queries.py` (runs with `pytest`):
-
-```python
-import pytest
-from sqlalchemy import create_engine, text
-import time
-from config import DB_URL, SLOW_QUERY_THRESHOLD_MS
-
-engine = create_engine(DB_URL)
-
-CRITICAL_QUERIES = [
-    ("user_lookup", "SELECT id FROM users WHERE email = (SELECT email FROM users LIMIT 1)"),
-    ("order_history", "SELECT id FROM orders WHERE user_id = 1 ORDER BY created_at DESC LIMIT 20"),
-    ("inventory_search", "SELECT product_id FROM inventory WHERE category = 'electronics' AND stock > 0 LIMIT 50"),
-]
-
-@pytest.mark.parametrize("label,sql", CRITICAL_QUERIES)
-def test_query_within_threshold(label: str, sql: str):
-    with engine.connect() as conn:
-        start = time.perf_counter()
-        conn.execute(text(sql))
-        elapsed_ms = (time.perf_counter() - start) * 1000
-
-    assert elapsed_ms < SLOW_QUERY_THRESHOLD_MS, (
-        f"{label} took {elapsed_ms:.1f}ms — exceeds threshold of {SLOW_QUERY_THRESHOLD_MS}ms"
-    )
-```
-
-Run:
 ```bash
 pytest benchmarks/test_slow_queries.py -v
 ```
 
----
-
-### Step 15: Create the CI workflow
-
-Create `.github/workflows/db-benchmarks.yml`:
-
-```yaml
-name: DB Performance Benchmarks
-
-on:
-  pull_request:
-    paths:
-      - "migrations/**"
-      - "benchmarks/**"
-      - "analysis/**"
-
-jobs:
-  benchmark:
-    runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: perftest
-          POSTGRES_PASSWORD: perftest
-          POSTGRES_DB: perfdb
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Apply schema
-        run: |
-          psql postgresql://perftest:perftest@localhost:5432/perfdb \
-            -f migrations/baseline/001_initial_schema.sql
-
-      - name: Seed test data (medium volume)
-        run: python data/seed.py 10000
-        env:
-          DB_HOST: localhost
-
-      - name: Run slow query threshold tests
-        run: pytest benchmarks/test_slow_queries.py -v
-        env:
-          DB_HOST: localhost
-
-      - name: Run regression report
-        run: python reports/query-regression-report.py
-        env:
-          DB_HOST: localhost
-
-      - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-results
-          path: reports/output/
-          retention-days: 90
-```
-
----
-
-## Phase 8 — Grafana Dashboard (Week 5)
-
-### Step 16: Add Grafana and Prometheus to Docker Compose
-
-Extend `docker/docker-compose.yml`:
-
-```yaml
-  grafana:
-    image: grafana/grafana:latest
-    ports:
-      - "3000:3000"
-    environment:
-      GF_SECURITY_ADMIN_PASSWORD: admin
-    volumes:
-      - grafana_data:/var/lib/grafana
-
-volumes:
-  pgdata:
-  grafana_data:
-```
-
-### Step 17: Export benchmark results to Grafana
-
-Create `reports/export_metrics.py` to write results to a Postgres metrics table that Grafana reads via its PostgreSQL data source:
-
-```python
-from sqlalchemy import create_engine, text
-from config import DB_URL
-
-CREATE_TABLE = """
-CREATE TABLE IF NOT EXISTS benchmark_results (
-    id SERIAL PRIMARY KEY,
-    run_at TIMESTAMPTZ DEFAULT now(),
-    volume TEXT,
-    query_label TEXT,
-    avg_ms FLOAT,
-    p95_ms FLOAT,
-    max_ms FLOAT
-);
-"""
-
-def export(volume: str, results: list[dict]):
-    engine = create_engine(DB_URL)
-    with engine.begin() as conn:
-        conn.execute(text(CREATE_TABLE))
-        conn.execute(
-            text(
-                "INSERT INTO benchmark_results (volume, query_label, avg_ms, p95_ms, max_ms) "
-                "VALUES (:volume, :query, :avg_ms, :p95_ms, :max_ms)"
-            ),
-            [{"volume": volume, **r} for r in results]
-        )
-    print(f"Exported {len(results)} results for volume={volume}")
-```
-
-### Step 18: Configure Grafana
-
-1. Open Grafana at `http://localhost:3000` (admin/admin).
-2. Add PostgreSQL as a data source pointing to the `postgres` service.
-3. Create a dashboard with a time-series panel using this query:
-   ```sql
-   SELECT run_at AS time, avg_ms, query_label
-   FROM benchmark_results
-   WHERE volume = 'medium'
-   ORDER BY run_at
-   ```
-4. Add panels for p95 latency and max latency per query across runs.
-5. Export the dashboard JSON to `docker/grafana-dashboard.json` for version control.
-
----
-
-## Final Checklist
-
-| Deliverable | Status |
-| --- | --- |
-| Dockerized PostgreSQL with `pg_stat_statements` | [ ] |
-| Deterministic data generator (1K / 10K / 100K / 1M rows) | [ ] |
-| Benchmark suite for 10+ queries across 4 volumes | [ ] |
-| EXPLAIN ANALYZE before/after index comparator | [ ] |
-| N+1 query detector with example simulation | [ ] |
-| Deadlock simulator with documented resolution | [ ] |
-| Index effectiveness tests for 3+ scenarios | [ ] |
-| Slow query threshold tests (`pytest`) | [ ] |
-| Query regression report with delta vs. previous run | [ ] |
-| CI workflow triggering on migration PRs | [ ] |
-| Grafana dashboard tracking latency over schema versions | [ ] |
-
----
-
-## Quick Reference: Key Commands
+Each parametrized test asserts that a critical query completes within `SLOW_QUERY_THRESHOLD_MS` (200 ms by default, set in `config.py`). A failing test means a query crossed the threshold — inspect the plan:
 
 ```bash
-# Start database
+python analysis/explain_analyzer.py
+```
+
+---
+
+### Tracking your own migrations
+
+1. Snapshot the baseline: `python reports/query_regression_report.py`
+2. Write the migration SQL in `migrations/v<N>_<description>/00N_<description>.sql`
+3. Apply: `python scripts/setup_schema.py --schema v<N>_<description>/00N_<description>`
+4. Re-run: `python reports/query_regression_report.py`
+5. Check gate: `pytest benchmarks/test_slow_queries.py -v`
+
+---
+
+## Phase 6 — Grafana Dashboard
+
+Benchmark results are exported to a `benchmark_results` table in PostgreSQL on every report run. Grafana reads that table via its built-in PostgreSQL datasource.
+
+### Starting Grafana
+
+Grafana is included in the same Compose file. No extra setup is needed:
+
+```bash
 docker compose -f docker/docker-compose.yml up -d
+```
+
+Open [http://localhost:3000](http://localhost:3000) and log in with `admin / admin`.
+
+The **Query Benchmark Results** dashboard and the **Benchmark DB** datasource are auto-provisioned from:
+
+```
+docker/grafana/
+├── provisioning/
+│   ├── datasources/postgres.yml   # connects to the postgres service
+│   └── dashboards/dashboard.yml   # points Grafana at the dashboard folder
+└── dashboards/benchmark.json      # the actual dashboard
+```
+
+### Dashboard panels
+
+| Panel | SQL column | Use |
+|---|---|---|
+| Avg Latency Over Time | `avg_ms` | Spot regressions across benchmark runs |
+| P95 Latency Over Time | `p95_ms` | Catch tail latency spikes after migrations |
+| Latest Benchmark Run | all columns | Quick snapshot of the most recent run |
+
+The **Volume** dropdown at the top filters all panels to `low`, `medium`, or `high`.
+
+### How data gets in
+
+`query_regression_report.py` calls `reports/export_metrics.py` after every run. The exporter creates `benchmark_results` if it doesn't exist, then inserts one row per query per run:
+
+```python
+from reports.export_metrics import export
+export("low", results)
+```
+
+To backfill Grafana from previously saved JSON files (e.g. runs made before Grafana was set up):
+
+```bash
+python reports/export_metrics.py
+```
+
+---
+
+## Quick Reference
+
+```bash
+# Start database + Grafana
+docker compose -f docker/docker-compose.yml up -d
+# Open Grafana → http://localhost:3000  (admin / admin)
 
 # Seed data
 python data/seed.py 10000
 
-# Run benchmarks
-python benchmarks/scenarios/run_benchmark.py medium
+# --- N+1 Detection ---
+python analysis/n_plus_one_detector.py
 
-# Detect N+1 patterns
-python analysis/n-plus-one-detector.py
+# --- Deadlock Simulation ---
+python analysis/deadlock_simulator.py
 
-# Simulate deadlock
-python analysis/deadlock-simulator.py
+# --- Query Regression Tracking ---
+# 1. Baseline
+python reports/query_regression_report.py low
 
-# Compare EXPLAIN plans before/after index
-python analysis/explain-analyzer.py
+# 2. Capture EXPLAIN plan
+python analysis/explain_analyzer.py
 
-# Run index effectiveness tests
-python benchmarks/scenarios/index_effectiveness.py
+# 3. Apply migration
+python scripts/setup_schema.py --schema v2_add_indexes/002_add_indexes
 
-# Run slow query tests
+# 4. Measure impact
+python reports/query_regression_report.py low
+
+# 5. Threshold gate
 pytest benchmarks/test_slow_queries.py -v
-
-# Generate regression report
-python reports/query-regression-report.py
 ```
+
+---
+
+## Deliverable Checklist
+
+| Deliverable | Status |
+|---|---|
+| Dockerized PostgreSQL with `pg_stat_statements` | ✅ |
+| Deterministic data generator (1K / 10K / 100K / 1M) | ✅ |
+| N+1 detector with bad/good simulation | ✅ |
+| Deadlock simulator with mitigation guide | ✅ |
+| EXPLAIN ANALYZE plan capture & diff | ✅ |
+| Query regression report with Δ vs previous run | ✅ |
+| Schema migration v2 (indexes) for regression demo | ✅ |
+| Slow query threshold tests (pytest) | ✅ |
+| Grafana dashboard with auto-provisioned datasource | ✅ |
+| Metrics exporter to `benchmark_results` table | ✅ |
 
 ---
 
 ## References
 
 - [PostgreSQL EXPLAIN documentation](https://www.postgresql.org/docs/current/sql-explain.html)
-- [pgbench — PostgreSQL benchmarking](https://www.postgresql.org/docs/current/pgbench.html)
-- [Percona Toolkit pt-query-digest](https://docs.percona.com/percona-toolkit/pt-query-digest.html)
+- [PostgreSQL deadlock detection](https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-DEADLOCKS)
 - [Use The Index, Luke — query optimization](https://use-the-index-luke.com/)
+- [pgbench](https://www.postgresql.org/docs/current/pgbench.html)
+- [Grafana PostgreSQL datasource docs](https://grafana.com/docs/grafana/latest/datasources/postgres/)

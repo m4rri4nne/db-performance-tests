@@ -1,32 +1,30 @@
-# 🐘 Database Performance Tests
+# Database Performance Tests
 
 ![Status](https://img.shields.io/badge/status-in%20progress-yellow?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?style=flat-square&logo=postgresql&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-required-2496ED?style=flat-square&logo=docker&logoColor=white)
-![Grafana](https://img.shields.io/badge/Grafana-dashboard-F46800?style=flat-square&logo=grafana&logoColor=white)
 ![pytest](https://img.shields.io/badge/tested%20with-pytest-0A9EDC?style=flat-square&logo=pytest&logoColor=white)
+![Grafana](https://img.shields.io/badge/Grafana-dashboard-F46800?style=flat-square&logo=grafana&logoColor=white)
 
-A PostgreSQL performance testing suite for measuring query latency, detecting N+1 patterns, simulating deadlocks, and tracking regressions across schema versions.
+A PostgreSQL performance testing suite focused on three scenarios:
 
----
-
-## 📖 Overview
-
-The project runs a Dockerized **PostgreSQL 16** instance with `pg_stat_statements` enabled and populates it with deterministic, production-like data (up to 1M rows). A benchmark suite measures critical query performance across four data volumes, and an analysis layer compares `EXPLAIN ANALYZE` plans before and after index changes. Results feed into a regression report and a **Grafana** dashboard.
+- **N+1 Query Detection** — instrument queries, surface repeated patterns, compare bad vs. fixed implementations
+- **Deadlock Simulation** — reproduce the classic reverse lock-order deadlock and document the fix
+- **Query Regression Tracking Across Schema Changes** — benchmark before and after a migration, diff execution plans, gate on latency thresholds with pytest
 
 **Schema:** `users` → `orders` → `order_items` + `inventory`
 
 ---
 
-## ✅ Prerequisites
+## Prerequisites
 
-- 🐳 Docker + Docker Compose
-- 🐍 Python 3.10+
+- Docker + Docker Compose
+- Python 3.10+
 
 ---
 
-## 🚀 Setup
+## Setup
 
 **1. Start the database**
 
@@ -34,7 +32,7 @@ The project runs a Dockerized **PostgreSQL 16** instance with `pg_stat_statement
 docker compose -f docker/docker-compose.yml up -d
 ```
 
-**2. Create a virtual environment and install dependencies**
+**2. Create virtual environment and install dependencies**
 
 ```bash
 python3 -m venv .venv
@@ -44,7 +42,7 @@ pip install -r requirements.txt
 
 **3. Configure environment variables**
 
-Create a `.env` file at the project root:
+Create `.env` at the project root:
 
 ```env
 DB_HOST=localhost
@@ -54,129 +52,196 @@ DB_USER=perftest
 DB_PASSWORD=perftest
 ```
 
-**4. Apply the schema**
+**4. Apply the schema and seed data**
 
 ```bash
-docker compose -f docker/docker-compose.yml exec -T postgres \
-  psql -U perftest -d perfdb < migrations/baseline/001_initial_schema.sql
+python scripts/setup_schema.py
+python data/seed.py 10000
 ```
 
 ---
 
-## 🧪 Usage
+## Scenarios
 
-All scripts are run from the **project root**.
-
-### 🌱 Seed data
+### N+1 Query Detection
 
 ```bash
-python data/seed.py 1000      # 1K users (~2.5K orders)
-python data/seed.py 10000     # 10K
-python data/seed.py 100000    # 100K
-python data/seed.py 1000000   # 1M — takes several minutes
+python analysis/n_plus_one_detector.py
 ```
 
-Each run truncates all tables first. The seed is deterministic (`SEED = 42`), so the same row count always produces the same data.
+Attaches a SQLAlchemy event listener, runs a simulated N+1 code path (one query per order row), then the fixed version (single JOIN). Prints a count of repeated normalized queries so the pattern is unmistakable.
 
-### ⚡ Run benchmarks
+```
+[BAD]  20 orders fetched → 21 queries fired (1 + 20)
+  N+1 candidates detected:
+    [20x] SELECT EMAIL FROM USERS WHERE ID = $?
+
+[GOOD] 20 orders+emails fetched → 1 query fired
+```
+
+To instrument your own code, import `attach_logger`, `reset_log`, and `detect` from `analysis/n_plus_one_detector.py`.
+
+---
+
+### Deadlock Simulation
 
 ```bash
-python benchmarks/scenarios/run_benchmark.py low     # 1K users
-python benchmarks/scenarios/run_benchmark.py medium  # 100K users
-python benchmarks/scenarios/run_benchmark.py high    # 1M users
+python analysis/deadlock_simulator.py
 ```
 
-Outputs `min`, `avg`, `p95`, and `max` latency (ms) for each query.
+Spawns two threads that acquire row locks in opposite order using a `threading.Barrier` to make the deadlock deterministic. PostgreSQL detects the cycle and rolls back one transaction automatically. The script prints which transaction was the victim and shows the consistent lock-ordering fix.
 
-### 🔍 Analyze query plans
+```
+Transaction A: committed
+Transaction B: rolled back — DeadlockDetected
+
+PostgreSQL detected the cycle and rolled back Transaction B.
+```
+
+---
+
+### Query Regression Tracking Across Schema Changes
+
+The workflow is: baseline → capture plan → migrate → measure impact → pytest gate.
+
+**1. Capture baseline performance**
 
 ```bash
-python analysis/explain-analyzer.py
+python reports/query_regression_report.py low
 ```
 
-Runs `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` before and after creating an index and saves the plans to `reports/`.
-
-### 🔁 Detect N+1 queries
+**2. Capture EXPLAIN plan before migration**
 
 ```bash
-python analysis/n-plus-one-detector.py
+python analysis/explain_analyzer.py
 ```
 
-Instruments the SQLAlchemy engine and flags any normalized query executed 5+ times in a single logical operation.
+Plans are saved as JSON to `reports/plans/`.
 
-### 💥 Simulate a deadlock
+**3. Apply migration**
 
 ```bash
-python analysis/deadlock-simulator.py
+python scripts/setup_schema.py --schema v2_add_indexes/002_add_indexes
 ```
 
-Spawns two concurrent transactions that acquire locks in opposing order. PostgreSQL detects and rolls one back automatically.
-
-### 📊 Test index effectiveness
+**4. Measure the impact**
 
 ```bash
-python benchmarks/scenarios/index_effectiveness.py
+python reports/query_regression_report.py low
 ```
 
-Drops, benchmarks, creates, and re-benchmarks indexes for three scenarios: user lookup by country, inventory search by category, and orders by status.
+```
+Query            avg ms    p95 ms    max ms  Δ vs last
+order_history      0.38      0.62      0.95  -88.1% ✓
+inventory_search   0.28      0.45      0.70  -74.5% ✓
+```
 
-### 🐢 Slow query threshold tests (pytest)
+Queries that regressed by more than 20% are flagged with `⚠`.
+
+**5. Latency threshold gate**
 
 ```bash
 pytest benchmarks/test_slow_queries.py -v
 ```
 
-Fails if any critical query exceeds `SLOW_QUERY_THRESHOLD_MS` (default: 200ms), as defined in `config.py`.
-
-### 📈 Query regression report
-
-```bash
-python reports/query-regression-report.py
-```
-
-Runs all benchmark volumes, compares against the previous run saved in `reports/output/`, and prints a delta table (`Δ vs last`).
+Fails if any critical query exceeds `SLOW_QUERY_THRESHOLD_MS` (200 ms, set in `config.py`).
 
 ---
 
-## 🗂️ Project Structure
+## Grafana Dashboard
+
+Benchmark results are automatically exported to a `benchmark_results` table in PostgreSQL and visualized in Grafana.
+
+**Start Grafana:**
+
+```bash
+docker compose -f docker/docker-compose.yml up -d
+```
+
+Open [http://localhost:3000](http://localhost:3000) — login `admin / admin`.
+
+The **Query Benchmark Results** dashboard loads automatically. No manual setup needed: the PostgreSQL datasource and dashboard are provisioned on startup.
+
+**Panels:**
+
+| Panel | What it shows |
+|---|---|
+| Avg Latency Over Time | avg_ms per query, color-coded — turns yellow at 100 ms, red at 200 ms |
+| P95 Latency Over Time | p95_ms per query — highlights tail latency spikes across migrations |
+| Latest Benchmark Run | Table of the most recent run: avg / p95 / max per query |
+
+Use the **Volume** dropdown at the top to switch between `low`, `medium`, and `high` data sets.
+
+Every time you run the regression report, results are written to the table automatically:
+
+```bash
+python reports/query_regression_report.py low
+# → runs benchmarks, saves JSON, exports to benchmark_results, prints delta table
+```
+
+To backfill Grafana from previously saved JSON files:
+
+```bash
+python reports/export_metrics.py
+```
+
+---
+
+## Seeding data
+
+```bash
+python data/seed.py 1000      # quick smoke test
+python data/seed.py 10000     # development
+python data/seed.py 100000    # regression benchmarks
+```
+
+Each run truncates all tables. The seed is deterministic (`SEED = 42`).
+
+---
+
+## Project Structure
 
 ```
 .
-├── config.py                          # DB_URL and threshold config (reads .env)
-├── data/
-│   ├── seed.py                        # Deterministic data generator
-│   └── distributions.json             # Country, order status, category weights
-├── migrations/
-│   └── baseline/
-│       ├── 001_initial_schema.sql     # Table definitions
-│       └── schema_v1.sql              # Schema snapshot for regression comparison
-├── benchmarks/
-│   ├── queries/                       # Raw .sql files for critical paths
-│   ├── scenarios/
-│   │   ├── run_benchmark.py           # Volume benchmark runner
-│   │   └── index_effectiveness.py    # Before/after index comparison
-│   └── test_slow_queries.py          # pytest threshold tests
+├── config.py
 ├── analysis/
-│   ├── explain-analyzer.py            # EXPLAIN ANALYZE plan comparator
-│   ├── n-plus-one-detector.py        # N+1 pattern detector
-│   └── deadlock-simulator.py         # Concurrent transaction deadlock demo
+│   ├── n_plus_one_detector.py     # N+1 detection and simulation
+│   ├── deadlock_simulator.py      # Concurrent deadlock demo
+│   └── explain_analyzer.py        # EXPLAIN plan capture and diff
+├── benchmarks/
+│   ├── queries/                   # Raw .sql files
+│   ├── scenarios/
+│   │   └── run_benchmark.py       # Volume benchmark runner
+│   └── test_slow_queries.py       # pytest latency threshold gate
+├── data/
+│   ├── seed.py
+│   └── distributions.json
+├── migrations/
+│   ├── baseline/
+│   │   └── 001_initial_schema.sql
+│   └── v2_add_indexes/
+│       └── 002_add_indexes.sql    # Sample migration for regression demo
 ├── reports/
-│   ├── query-regression-report.py    # Regression diff report
-│   ├── export_metrics.py             # Writes results to DB for Grafana
-│   └── output/                       # Generated JSON result files
+│   ├── query_regression_report.py # Delta reporter (also exports to Grafana)
+│   ├── export_metrics.py          # Writes results to benchmark_results table
+│   ├── output/                    # Timestamped benchmark JSON results
+│   └── plans/                     # Saved EXPLAIN plans
+├── scripts/
+│   └── setup_schema.py
 └── docker/
-    ├── docker-compose.yml             # PostgreSQL 16 + Grafana
-    └── init.sql                       # pg_stat_statements extension
+    ├── docker-compose.yml         # PostgreSQL + Grafana
+    ├── init.sql
+    └── grafana/
+        ├── provisioning/
+        │   ├── datasources/postgres.yml
+        │   └── dashboards/dashboard.yml
+        └── dashboards/benchmark.json  # Auto-provisioned dashboard
 ```
 
 ---
 
-## 📡 Grafana Dashboard
+## References
 
-Grafana is available at `http://localhost:3000` (admin/admin) after adding it to the Compose file. It reads from a `benchmark_results` table populated by `reports/export_metrics.py` and tracks `avg_ms`, `p95_ms`, and `max_ms` per query over time.
-
----
-
-## ⚙️ CI
-
-The GitHub Actions workflow at `.github/workflows/db-benchmarks.yml` triggers on pull requests that touch `migrations/`, `benchmarks/`, or `analysis/`. It spins up PostgreSQL as a service, seeds 10K rows, runs the pytest threshold tests, and uploads benchmark results as an artifact.
+- [PostgreSQL EXPLAIN documentation](https://www.postgresql.org/docs/current/sql-explain.html)
+- [PostgreSQL deadlock detection](https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-DEADLOCKS)
+- [Use The Index, Luke](https://use-the-index-luke.com/)

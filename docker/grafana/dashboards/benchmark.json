@@ -1,0 +1,201 @@
+{
+  "title": "Query Benchmark Results",
+  "uid": "db-perf-bench-001",
+  "description": "Latency trends for N+1 detection, deadlock, and regression tracking benchmarks",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-7d", "to": "now" },
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "tags": ["performance", "postgres", "benchmarks"],
+  "templating": {
+    "list": [
+      {
+        "type": "custom",
+        "name": "volume",
+        "label": "Volume",
+        "description": "Data volume used during the benchmark run",
+        "current": { "text": "low", "value": "low" },
+        "options": [
+          { "selected": true,  "text": "low",    "value": "low"    },
+          { "selected": false, "text": "medium",  "value": "medium" },
+          { "selected": false, "text": "high",    "value": "high"   }
+        ],
+        "query": "low,medium,high",
+        "hide": 0,
+        "multi": false,
+        "includeAll": false
+      }
+    ]
+  },
+  "annotations": { "list": [] },
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Avg Latency Over Time (ms)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "benchmark-postgres" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "scaleDistribution": { "type": "linear" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 100 },
+              { "color": "red",    "value": 200 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["mean", "max", "last"]
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "benchmark-postgres" },
+          "refId": "A",
+          "rawQuery": true,
+          "format": "time_series",
+          "rawSql": "SELECT\n  run_at AS \"time\",\n  avg_ms AS \"value\",\n  query_label AS \"metric\"\nFROM benchmark_results\nWHERE volume = '$volume'\n  AND $__timeFilter(run_at)\nORDER BY run_at ASC"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "P95 Latency Over Time (ms)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "benchmark-postgres" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "scaleDistribution": { "type": "linear" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 150 },
+              { "color": "red",    "value": 300 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": ["mean", "max", "last"]
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "benchmark-postgres" },
+          "refId": "A",
+          "rawQuery": true,
+          "format": "time_series",
+          "rawSql": "SELECT\n  run_at AS \"time\",\n  p95_ms AS \"value\",\n  query_label AS \"metric\"\nFROM benchmark_results\nWHERE volume = '$volume'\n  AND $__timeFilter(run_at)\nORDER BY run_at ASC"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "Latest Benchmark Run",
+      "description": "Results from the most recent benchmark run for the selected volume",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 8 },
+      "datasource": { "type": "postgres", "uid": "benchmark-postgres" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "inspect": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 100  },
+              { "color": "red",    "value": 200  }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Avg ms" },
+            "properties": [
+              { "id": "unit", "value": "ms" },
+              { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } },
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 100 }, { "color": "red", "value": 200 }] } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "P95 ms" },
+            "properties": [
+              { "id": "unit", "value": "ms" }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Max ms" },
+            "properties": [
+              { "id": "unit", "value": "ms" }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "cellHeight": "sm",
+        "showHeader": true,
+        "footer": { "show": false, "reducer": ["sum"], "countRows": false, "fields": "" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "benchmark-postgres" },
+          "refId": "A",
+          "rawQuery": true,
+          "format": "table",
+          "rawSql": "SELECT\n  query_label AS \"Query\",\n  avg_ms       AS \"Avg ms\",\n  p95_ms       AS \"P95 ms\",\n  max_ms       AS \"Max ms\",\n  run_at       AS \"Run at\"\nFROM benchmark_results\nWHERE volume = '$volume'\n  AND run_at = (\n    SELECT MAX(run_at)\n    FROM benchmark_results\n    WHERE volume = '$volume'\n  )\nORDER BY query_label ASC"
+        }
+      ]
+    }
+  ]
+}
